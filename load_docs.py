@@ -1,7 +1,12 @@
-import re   
+import re
+import hashlib
 from pathlib import Path
 
-root_dir = Path("data/companion.home-assistant-master/docs")
+ROOT_DIR = Path("data/companion.home-assistant-master/docs")
+
+FENCE = "`" * 3
+MIN_SIZE = 200
+MAX_SIZE = 2000   # placeholder, change it after the token check
 
 
 def split_front_matter(text):
@@ -21,23 +26,9 @@ def split_front_matter(text):
     return title, body
 
 
-# Load one file and separate the label from the content
-text = (root_dir / "core" / "sensors.md").read_text(encoding="utf-8")
-title, body = split_front_matter(text)
-
-# Print the headings with their levels
-print("TITLE:", title)
-for line in body.splitlines():
-    if line.startswith(("# ", "## ", "### ", "#### ")):
-        level = len(line) - len(line.lstrip("#"))
-        clean_line = line.lstrip("#").strip()
-        print(level, clean_line)
-
-
-FENCE = "`" * 3
-#body (actual Markdown content), #rel_path, #file_title (title of the whole file )
+# body (actual Markdown content), rel_path, file_title (title of the whole file)
 def split_into_chunks(body, rel_path, file_title):
-    chunks = [] # start with an empty list 
+    chunks = []                # start with an empty list
     parent = None              # the current level-2 heading
     heading_path = file_title  # intro text before any heading uses the file title
     lines = []
@@ -84,25 +75,6 @@ def split_into_chunks(body, rel_path, file_title):
     return chunks
 
 
-
-
-file_list = [p for p in root_dir.rglob("*") if p.suffix in (".md", ".mdx")]
-
-
-
-all_chunks = []
-
-for file_path in sorted(file_list):
-    text = file_path.read_text(encoding="utf-8")
-    title, body = split_front_matter(text)
-    rel_path = file_path.relative_to(root_dir).as_posix()
-    all_chunks.extend(split_into_chunks(body, rel_path, title or file_path.stem))
-
-
-
-
-MIN_SIZE = 200
-
 def merge_small_chunks(chunks, min_size):
     merged = []
     for chunk in chunks:
@@ -118,11 +90,6 @@ def merge_small_chunks(chunks, min_size):
                 continue
         merged.append(chunk)
     return merged
-
-all_chunks = merge_small_chunks(all_chunks, MIN_SIZE)
-
-
-MAX_SIZE = 2000   # placeholder, change it after you decide
 
 
 def make_units(text):
@@ -209,46 +176,42 @@ def split_big_chunk(chunk, max_size):
     return result
 
 
-final_chunks = []
-for chunk in all_chunks:
-    final_chunks.extend(split_big_chunk(chunk, MAX_SIZE))
-all_chunks = final_chunks
+def make_chunk_id(chunk):
+    """Same file + heading + text -> same ID on every run. Changed text -> new ID."""
+    raw = chunk["file"] + "|" + chunk["heading"] + "|" + chunk["text"]
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
-print(len(file_list), "files ->", len(all_chunks), "chunks")
+def load_all_chunks(root_dir=ROOT_DIR, min_size=MIN_SIZE, max_size=MAX_SIZE):
+    """Build, merge, split, and give every chunk an ID. Returns a list of dicts."""
+    file_list = [p for p in root_dir.rglob("*") if p.suffix in (".md", ".mdx")]
+
+    chunks = []
+    for file_path in sorted(file_list):
+        text = file_path.read_text(encoding="utf-8")
+        title, body = split_front_matter(text)
+        rel_path = file_path.relative_to(root_dir).as_posix()
+        chunks.extend(split_into_chunks(body, rel_path, title or file_path.stem))
+
+    chunks = merge_small_chunks(chunks, min_size)
+
+    final_chunks = []
+    for chunk in chunks:
+        final_chunks.extend(split_big_chunk(chunk, max_size))
+
+    seen = {}
+    for chunk in final_chunks:
+        base_id = make_chunk_id(chunk)
+        count = seen.get(base_id, 0)       # 0 the first time we meet this ID
+        seen[base_id] = count + 1
+        chunk["id"] = base_id if count == 0 else f"{base_id}-{count}"
+    return final_chunks
 
 
-# 1. Create a list of text lengths for every chunk
-text_lengths = [len(c['text']) for c in all_chunks]
-
-
-# 2. Calculate the metrics
-print("--Min Length--")
-min_length = min(text_lengths)
-print(min_length)
-print("--Max Length--")
-max_length = max(text_lengths)
-print(max_length)
-print("--Avg Length--")
-avg_length = sum(text_lengths) / len(text_lengths)
-print(avg_length)
-
-
-
-
-sorted_chunks = sorted(all_chunks, key=lambda c: len(c["text"]))
-
-# first five 
-longest = sorted_chunks[-5:]
-shortest = sorted_chunks[:5]
-print("5 LONGEST")
-for c in longest:
-    info= len(c["text"]), c["file"], c["heading"]
-    print(info)
-    print(c["text"][:100])
-print("5 SHORTEST")
-for c in shortest:
-    info=len(c["text"]), c["file"], c["heading"]
-    print(info)
-    print(c["text"][:100])
-       
+if __name__ == "__main__":
+    all_chunks = load_all_chunks()
+    text_lengths = [len(c["text"]) for c in all_chunks]
+    print(len(all_chunks), "chunks")
+    print("Min length:", min(text_lengths))
+    print("Max length:", max(text_lengths))
+    print("Avg length:", round(sum(text_lengths) / len(text_lengths)))
