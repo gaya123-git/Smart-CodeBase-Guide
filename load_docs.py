@@ -1,7 +1,12 @@
-import re   
+import re
+import hashlib
 from pathlib import Path
 
-root_dir = Path("data/companion.home-assistant-master/docs")
+ROOT_DIR = Path("data/companion.home-assistant-master/docs")
+
+FENCE = "`" * 3
+MIN_SIZE = 200
+MAX_SIZE = 2000   # placeholder, change it after the token check
 
 
 def split_front_matter(text):
@@ -21,23 +26,9 @@ def split_front_matter(text):
     return title, body
 
 
-# Load one file and separate the label from the content
-text = (root_dir / "core" / "sensors.md").read_text(encoding="utf-8")
-title, body = split_front_matter(text)
-
-# Print the headings with their levels
-print("TITLE:", title)
-for line in body.splitlines():
-    if line.startswith(("# ", "## ", "### ", "#### ")):
-        level = len(line) - len(line.lstrip("#"))
-        clean_line = line.lstrip("#").strip()
-        print(level, clean_line)
-
-
-FENCE = "`" * 3
-#body (actual Markdown content), #rel_path, #file_title (title of the whole file )
+# body (actual Markdown content), rel_path, file_title (title of the whole file)
 def split_into_chunks(body, rel_path, file_title):
-    chunks = [] # start with an empty list 
+    chunks = []                # start with an empty list
     parent = None              # the current level-2 heading
     heading_path = file_title  # intro text before any heading uses the file title
     lines = []
@@ -84,25 +75,6 @@ def split_into_chunks(body, rel_path, file_title):
     return chunks
 
 
-
-
-file_list = [p for p in root_dir.rglob("*") if p.suffix in (".md", ".mdx")]
-
-
-
-all_chunks = []
-
-for file_path in sorted(file_list):
-    text = file_path.read_text(encoding="utf-8")
-    title, body = split_front_matter(text)
-    rel_path = file_path.relative_to(root_dir).as_posix()
-    all_chunks.extend(split_into_chunks(body, rel_path, title or file_path.stem))
-
-
-
-
-MIN_SIZE = 200
-
 def merge_small_chunks(chunks, min_size):
     merged = []
     for chunk in chunks:
@@ -118,11 +90,6 @@ def merge_small_chunks(chunks, min_size):
                 continue
         merged.append(chunk)
     return merged
-
-all_chunks = merge_small_chunks(all_chunks, MIN_SIZE)
-
-
-MAX_SIZE = 2000   # placeholder, change it after you decide
 
 
 def make_units(text):
@@ -209,46 +176,122 @@ def split_big_chunk(chunk, max_size):
     return result
 
 
-final_chunks = []
-for chunk in all_chunks:
-    final_chunks.extend(split_big_chunk(chunk, MAX_SIZE))
-all_chunks = final_chunks
+def make_chunk_id(chunk):
+    """Same file + heading + text -> same ID on every run. Changed text -> new ID."""
+    raw = chunk["file"] + "|" + chunk["heading"] + "|" + chunk["text"]
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+def clean_cell(text):
+    text = re.sub(r"<img[^>]*alt=\"([^\"]*)\"[^>]*/?>", r"\1", text)   # image -> its alt text
+    text = re.sub(r"<br\s*/?>", " ", text)
+    text = re.sub(r"<[^>]+>", "", text)                                  # drop other tags
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)                # ![alt](url) -> alt
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)                 # [text](url) -> text
+    return re.sub(r"\s+", " ", text).strip()
 
 
-print(len(file_list), "files ->", len(all_chunks), "chunks")
+def md_table_to_sentences(table_lines):
+    header = [clean_cell(c) for c in table_lines[0].strip().strip("|").split("|")]
+    sentences = []
+    for line in table_lines[2:]:                                         # skip header and |---| line
+        cells = [clean_cell(c) for c in line.strip().strip("|").split("|")]
+        parts = []
+        for name, value in zip(header, cells):
+            value = value.rstrip(".")                                    # avoid ".." at the end
+            if value:
+                parts.append(f"{name}: {value}" if name else value)
+        if parts:
+            sentences.append(". ".join(parts) + ".")
+    return sentences
 
 
-# 1. Create a list of text lengths for every chunk
-text_lengths = [len(c['text']) for c in all_chunks]
+def convert_md_tables(text):
+    out, table, in_code = [], [], False
+    for line in text.splitlines():
+        if line.strip().startswith(FENCE):
+            in_code = not in_code
+        if not in_code and line.startswith("|"):
+            table.append(line)
+            continue
+        if table:
+            out.extend(md_table_to_sentences(table) if len(table) > 2 else table)
+            table = []
+        out.append(line)
+    if table:
+        out.extend(md_table_to_sentences(table) if len(table) > 2 else table)
+    return "\n".join(out)
 
 
-# 2. Calculate the metrics
-print("--Min Length--")
-min_length = min(text_lengths)
-print(min_length)
-print("--Max Length--")
-max_length = max(text_lengths)
-print(max_length)
-print("--Avg Length--")
-avg_length = sum(text_lengths) / len(text_lengths)
-print(avg_length)
+def html_table_to_sentences(text):
+    sentences = []
+    for thead, tbody in re.findall(r"(<thead>.*?</thead>)\s*<tbody>(.*?)</tbody>", text, re.S):
+        head = [clean_cell(h) for h in re.findall(r"<th.*?>(.*?)</th>", thead, re.S)]
+        section, columns = head[0], head[1:]
+        for row in re.findall(r"<tr>.*?</tr>", tbody, re.S):
+            cells = [clean_cell(c) for c in re.findall(r"<td.*?>(.*?)</td>", row, re.S)]
+            if not cells:
+                continue
+            feature, marks = cells[0], cells[1:]
+            marks = marks + [""] * (len(columns) - len(marks))           # short rows: missing = no
+            yes = [col for col, mark in zip(columns, marks) if mark]
+            no = [col for col, mark in zip(columns, marks) if not mark]
+            sentence = f"{feature} ({section}): "
+            sentence += "supported on " + ", ".join(yes) if yes else "not supported on any platform"
+            if yes and no:
+                sentence += "; not supported on " + ", ".join(no)
+            sentences.append(sentence + ".")
+    return "\n".join(sentences)
 
 
+def convert_tables(chunk):
+    text = chunk["text"]
+    if text.lstrip().startswith("<table"):
+        text = html_table_to_sentences(text)
+    elif "|" in text:
+        text = convert_md_tables(text)
+    new_chunk = dict(chunk)
+    new_chunk["text"] = text
+    return new_chunk
+
+def strip_images(text):
+    """![Android](/assets/android.svg) -> Android (keep the alt text, drop the markup)."""
+    return re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+
+def load_all_chunks(root_dir=ROOT_DIR, min_size=MIN_SIZE, max_size=MAX_SIZE):
+    """Build, merge, split, and give every chunk an ID. Returns a list of dicts."""
+    file_list = [p for p in root_dir.rglob("*") if p.suffix in (".md", ".mdx")]
+
+    chunks = []
+    for file_path in sorted(file_list):
+        text = file_path.read_text(encoding="utf-8")
+        title, body = split_front_matter(text)
+        rel_path = file_path.relative_to(root_dir).as_posix()
+        chunks.extend(split_into_chunks(body, rel_path, title or file_path.stem))
+   
+    for chunk in chunks:
+        chunk["heading"] = strip_images(chunk["heading"])
+        chunk["text"] = strip_images(chunk["text"])
+    chunks = [convert_tables(c) for c in chunks]
+    
+    chunks = merge_small_chunks(chunks, min_size)
+
+    final_chunks = []
+    for chunk in chunks:
+        final_chunks.extend(split_big_chunk(chunk, max_size))
+
+    seen = {}
+    for chunk in final_chunks:
+        base_id = make_chunk_id(chunk)
+        count = seen.get(base_id, 0)       # 0 the first time we meet this ID
+        seen[base_id] = count + 1
+        chunk["id"] = base_id if count == 0 else f"{base_id}-{count}"
+    return final_chunks
 
 
-sorted_chunks = sorted(all_chunks, key=lambda c: len(c["text"]))
-
-# first five 
-longest = sorted_chunks[-5:]
-shortest = sorted_chunks[:5]
-print("5 LONGEST")
-for c in longest:
-    info= len(c["text"]), c["file"], c["heading"]
-    print(info)
-    print(c["text"][:100])
-print("5 SHORTEST")
-for c in shortest:
-    info=len(c["text"]), c["file"], c["heading"]
-    print(info)
-    print(c["text"][:100])
-       
+if __name__ == "__main__":
+    all_chunks = load_all_chunks()
+    text_lengths = [len(c["text"]) for c in all_chunks]
+    print(len(all_chunks), "chunks")
+    print("Min length:", min(text_lengths))
+    print("Max length:", max(text_lengths))
+    print("Avg length:", round(sum(text_lengths) / len(text_lengths)))
