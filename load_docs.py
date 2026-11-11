@@ -181,6 +181,81 @@ def make_chunk_id(chunk):
     raw = chunk["file"] + "|" + chunk["heading"] + "|" + chunk["text"]
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
+def clean_cell(text):
+    text = re.sub(r"<img[^>]*alt=\"([^\"]*)\"[^>]*/?>", r"\1", text)   # image -> its alt text
+    text = re.sub(r"<br\s*/?>", " ", text)
+    text = re.sub(r"<[^>]+>", "", text)                                  # drop other tags
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)                # ![alt](url) -> alt
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)                 # [text](url) -> text
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def md_table_to_sentences(table_lines):
+    header = [clean_cell(c) for c in table_lines[0].strip().strip("|").split("|")]
+    sentences = []
+    for line in table_lines[2:]:                                         # skip header and |---| line
+        cells = [clean_cell(c) for c in line.strip().strip("|").split("|")]
+        parts = []
+        for name, value in zip(header, cells):
+            value = value.rstrip(".")                                    # avoid ".." at the end
+            if value:
+                parts.append(f"{name}: {value}" if name else value)
+        if parts:
+            sentences.append(". ".join(parts) + ".")
+    return sentences
+
+
+def convert_md_tables(text):
+    out, table, in_code = [], [], False
+    for line in text.splitlines():
+        if line.strip().startswith(FENCE):
+            in_code = not in_code
+        if not in_code and line.startswith("|"):
+            table.append(line)
+            continue
+        if table:
+            out.extend(md_table_to_sentences(table) if len(table) > 2 else table)
+            table = []
+        out.append(line)
+    if table:
+        out.extend(md_table_to_sentences(table) if len(table) > 2 else table)
+    return "\n".join(out)
+
+
+def html_table_to_sentences(text):
+    sentences = []
+    for thead, tbody in re.findall(r"(<thead>.*?</thead>)\s*<tbody>(.*?)</tbody>", text, re.S):
+        head = [clean_cell(h) for h in re.findall(r"<th.*?>(.*?)</th>", thead, re.S)]
+        section, columns = head[0], head[1:]
+        for row in re.findall(r"<tr>.*?</tr>", tbody, re.S):
+            cells = [clean_cell(c) for c in re.findall(r"<td.*?>(.*?)</td>", row, re.S)]
+            if not cells:
+                continue
+            feature, marks = cells[0], cells[1:]
+            marks = marks + [""] * (len(columns) - len(marks))           # short rows: missing = no
+            yes = [col for col, mark in zip(columns, marks) if mark]
+            no = [col for col, mark in zip(columns, marks) if not mark]
+            sentence = f"{feature} ({section}): "
+            sentence += "supported on " + ", ".join(yes) if yes else "not supported on any platform"
+            if yes and no:
+                sentence += "; not supported on " + ", ".join(no)
+            sentences.append(sentence + ".")
+    return "\n".join(sentences)
+
+
+def convert_tables(chunk):
+    text = chunk["text"]
+    if text.lstrip().startswith("<table"):
+        text = html_table_to_sentences(text)
+    elif "|" in text:
+        text = convert_md_tables(text)
+    new_chunk = dict(chunk)
+    new_chunk["text"] = text
+    return new_chunk
+
+def strip_images(text):
+    """![Android](/assets/android.svg) -> Android (keep the alt text, drop the markup)."""
+    return re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
 
 def load_all_chunks(root_dir=ROOT_DIR, min_size=MIN_SIZE, max_size=MAX_SIZE):
     """Build, merge, split, and give every chunk an ID. Returns a list of dicts."""
@@ -192,7 +267,12 @@ def load_all_chunks(root_dir=ROOT_DIR, min_size=MIN_SIZE, max_size=MAX_SIZE):
         title, body = split_front_matter(text)
         rel_path = file_path.relative_to(root_dir).as_posix()
         chunks.extend(split_into_chunks(body, rel_path, title or file_path.stem))
-
+   
+    for chunk in chunks:
+        chunk["heading"] = strip_images(chunk["heading"])
+        chunk["text"] = strip_images(chunk["text"])
+    chunks = [convert_tables(c) for c in chunks]
+    
     chunks = merge_small_chunks(chunks, min_size)
 
     final_chunks = []
